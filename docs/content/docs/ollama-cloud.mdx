@@ -1,0 +1,236 @@
+---
+title: Ollama Cloud
+description: Use Headroom as a compression proxy in front of Ollama Cloud, including Hermes Agent and the local Ollama server.
+---
+
+# Ollama Cloud
+
+Headroom works as a transparent compression proxy in front of [Ollama Cloud](https://ollama.com/cloud) (and any self-hosted Ollama server). The OpenAI-compatible transport already understands Ollama's API surface — you just point it at the right `base_url`.
+
+## Why use Headroom with Ollama
+
+- **78% average token reduction** on tool-heavy agent loops (measured on Hermes Agent with kimi-k2.6 on Ollama Cloud)
+- **93% peak reduction** on log dumps and structured data
+- **Zero code changes** — the proxy sits in front of the upstream
+- **Local-first** — your messages, tool outputs, and compressed cache all stay on your box; only the compressed payload hits Ollama
+
+## Quick start (5 minutes)
+
+### 1. Install Headroom
+
+```bash
+uv pip install "headroom-ai[proxy]" --system  # or use a venv
+```
+
+### 2. Get an Ollama Cloud API key
+
+Sign up at <https://ollama.com/settings> and copy your `OLLAMA_API_KEY`. The key is your bearer for `https://ollama.com/v1`.
+
+### 3. Run the proxy
+
+```bash
+export OPENAI_TARGET_API_URL="https://ollama.com/v1"
+export OPENAI_API_KEY="$OLLAMA_API_KEY"     # proxy looks for OPENAI_API_KEY
+export HEADROOM_TELEMETRY=off
+export HEADROOM_FORCE_KOMPRESS=1
+export HEADROOM_MIN_TOKENS=*** 256           # default 500; lower = more aggressive
+export HEADROOM_ACCURACY_GUARD=loose        # default strict
+export HEADROOM_SAVINGS_PROFILE=balanced
+export HEADROOM_COMPRESS_USER_MESSAGES=1
+headroom proxy --port 8787 --host 127.0.0.1 --workers 1
+```
+
+### 4. Point your client at the proxy
+
+| Client | Configuration |
+|---|---|
+| **OpenAI Python SDK** | `openai.OpenAI(base_url="http://127.0.0.1:8787/v1", api_key=...)` |
+| **Anthropic Python SDK** | `anthropic.Anthropic(base_url="http://127.0.0.1:8787")` |
+| **curl** | `curl http://127.0.0.1:8787/v1/chat/completions ...` |
+| **Hermes Agent** | `hermes config set model.base_url http://127.0.0.1:8787/v1` |
+| **LangChain ChatOpenAI** | `ChatOpenAI(base_url="http://127.0.0.1:8787/v1", ...)` |
+
+The proxy is **transparent** — same request format, same response format, but the upstream sees fewer tokens.
+
+## Local Ollama server
+
+Same setup, different `OPENAI_TARGET_API_URL`:
+
+```bash
+export OPENAI_TARGET_API_URL="http://localhost:11434/v1"
+export OPENAI_API_KEY="ollama"              # any non-empty value; Ollama ignores it
+headroom proxy --port 8787 --host 127.0.0.1 --workers 1
+```
+
+Enable iGPU acceleration on the Ollama server (Intel Arc Xe-LPG, AMD ROCm, NVIDIA CUDA, Apple Metal) before pointing the proxy at it — the proxy only compresses, it doesn't accelerate inference.
+
+## Verified environment
+
+| Component | Value |
+|---|---|
+| **Headroom version** | 0.26.0 |
+| **Upstream** | `https://ollama.com/v1` (Ollama Cloud) |
+| **Default model** | `kimi-k2.6` |
+| **Proxy address** | `http://127.0.0.1:8787/v1` |
+| **Hermes base_url** | `http://127.0.0.1:8787/v1` |
+| **Compression (avg)** | 78% |
+| **Compression (peak)** | 93% on log dumps |
+| **Strategies fired** | `text`, `search`, `smart_crusher`, `log`, `code_aware`, `kompress` |
+| **Ollama VRAM cap** | 16 GB hard / 14 GB soft (cgroup MemoryMax) |
+| **iGPU** | Intel Arc Xe-LPG (Meteor Lake), enabled via `OLLAMA_IGPU_ENABLE=1` |
+
+## Performance numbers
+
+Measured on Hermes Agent tool-heavy sessions routed through the proxy to Ollama Cloud:
+
+| Content type | Before | After | Savings |
+|---|---|---|---|
+| Structured log dump (2K tokens) | 2,052 | 142 | **93%** |
+| JSON array (5.9K tokens) | 5,941 | 2,195 | **63%** |
+| Multi-turn agent loop (5 turns) | 481 each | 481 each | prefix frozen for cache |
+| Code block | 3,644 | 3,644 | 0% (protected) |
+| Markdown report | 2,018 | 2,018 | 0% (no compressible pattern) |
+
+The `code` and `markdown` cases are *intentionally* not compressed — code blocks preserve structure for the model, and prose is already token-efficient.
+
+## Operating modes
+
+The proxy supports two modes via `HEADROOM_MODE`:
+
+| Mode | Use when | Trade-off |
+|---|---|---|
+| `token` (default) | Ollama Cloud, OpenAI, Anthropic via direct | Aggressive compression, no upstream cache hits |
+| `cache` | Upstream supports prompt caching (Anthropic, OpenAI direct) | Freezes prefix for cache hits, **0% compression** on Ollama Cloud |
+
+**Ollama Cloud has no prompt cache.** Use `token` mode. If you ever route to Anthropic or OpenAI direct, switch to `cache` mode for up to 70% cost reduction on cached prefixes.
+
+## Permanent deployment (systemd)
+
+For a setup that survives reboot and crash, run the proxy under systemd-user with linger enabled.
+
+`~/.config/systemd/user/headroom-proxy.service`:
+
+```ini
+[Unit]
+Description=Headroom Token-Saver Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/YOUR_USER/.local/venvs/headroom
+EnvironmentFile=/path/to/headroom.env
+ExecStart=/bin/bash -c "set -a && source /path/to/headroom.env && set +a && exec /home/YOUR_USER/.local/venvs/headroom/bin/headroom proxy --port 8787 --host 127.0.0.1 --workers 1"
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+StandardOutput=append:/tmp/headroom-proxy.log
+StandardError=append:/tmp/headroom-proxy.log
+
+[Install]
+WantedBy=default.target
+```
+
+`/path/to/headroom.env` (mode 600):
+
+```
+OLLAMA_API_KEY=your_key_here
+OLLAMA_BASE_URL=https://ollama.com/v1
+OPENAI_TARGET_API_URL=https://ollama.com/v1
+OPENAI_API_KEY=your_key_here
+HEADROOM_TELEMETRY=off
+HEADROOM_FORCE_KOMPRESS=1
+HEADROOM_MIN_TOKENS=*** 256
+HEADROOM_ACCURACY_GUARD=loose
+HEADROOM_SAVINGS_PROFILE=balanced
+HEADROOM_COMPRESS_USER_MESSAGES=1
+```
+
+Enable and start:
+
+```bash
+loginctl enable-linger $USER
+systemctl --user daemon-reload
+systemctl --user enable --now headroom-proxy.service
+```
+
+The `bash -c` wrapper is needed because systemd returns `203/EXEC` when directly exec'ing a venv script on Fedora's tmpfs-protected /home. See the [Troubleshooting](#troubleshooting) section.
+
+## Environment variables
+
+| Variable | Default | Aggressive | Notes |
+|---|---|---|---|
+| `OPENAI_TARGET_API_URL` | — | `https://ollama.com/v1` | **Required.** Where the proxy sends traffic. |
+| `OPENAI_API_KEY` | — | (your Ollama key) | **Required.** Proxy looks for `OPENAI_API_KEY`, not `OLLAMA_API_KEY`, even when upstream is ollama.com. |
+| `HEADROOM_TELEMETRY` | on | `off` | Disable beacon to chopratejas telemetry server |
+| `HEADROOM_FORCE_KOMPRESS` | 0 | `1` | Always try the Kompress-base transformer |
+| `HEADROOM_MIN_TOKENS` | 500 | `256` | Lower threshold = more requests become eligible for compression |
+| `HEADROOM_ACCURACY_GUARD` | strict | `loose` | Allows more aggressive rewriting |
+| `HEADROOM_SAVINGS_PROFILE` | default | `balanced` | Preset for compression aggressiveness |
+| `HEADROOM_COMPRESS_USER_MESSAGES` | 0 | `1` | Compresses user role (default is protected) |
+| `HEADROOM_MODE` | `token` | n/a | `cache` mode is **0% on Ollama Cloud** — don't use |
+
+## Self-protection rule
+
+When running THROUGH the proxy, if Ollama Cloud fails 3 consecutive calls, **immediately run the kill-switch and revert to the direct ollama URL**:
+
+```bash
+hermes config set model.base_url https://ollama.com/v1
+```
+
+(Or whatever your client's kill-switch is.) Never let the agent strand itself without LLM access — better to lose compression for a session than to lose the session entirely.
+
+## Observability
+
+| Endpoint | What |
+|---|---|
+| `http://127.0.0.1:8787/readyz` | Liveness check |
+| `http://127.0.0.1:8787/stats` | Per-request compression stats, totals, strategy breakdown |
+| `http://127.0.0.1:8787/stats-history` | Lifetime + display session + time series |
+| `http://127.0.0.1:8787/metrics` | Prometheus-format metrics (67 series) |
+| `~/.headroom/proxy_savings.json` | Persistent JSON, accumulates across restarts |
+
+Quick stats summary:
+
+```bash
+curl -s http://127.0.0.1:8787/stats | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+s = d['summary']['compression']
+print(f'Avg: {s[\"avg_compression_pct\"]}% | Best: {s[\"best_compression_pct\"]}% | Saved: {s[\"total_tokens_removed\"]:,} tokens')
+print('Strategies:', d.get('compressions_by_strategy', {}))
+"
+```
+
+## Troubleshooting
+
+### `203/EXEC` when starting the systemd service
+
+The venv is on a `tmpfs` mount (e.g. `/tmp`) or systemd is sandboxing the exec. Two fixes:
+1. Move the venv off `/tmp` to a real filesystem: `cp -r /tmp/headroom-recon ~/.local/venvs/headroom`
+2. Wrap `ExecStart` in `bash -c` so the interpreter is found inside the namespace
+
+### 401 Unauthorized from Ollama Cloud
+
+You forgot `OPENAI_API_KEY`. The proxy looks for `OPENAI_API_KEY` in its environment, not `OLLAMA_API_KEY`, even when routing to ollama.com. Set both to the same value.
+
+### 0% compression on every request
+
+The router is deciding `noop` or `protected:user_message`. Check `/stats`:
+- `cache_miss: high, small: high` → content is too small, lower `HEADROOM_MIN_TOKENS`
+- `prefix_frozen: high` → CCR mode is on, switch `HEADROOM_MODE=token`
+- `protected:user_message: high` → set `HEADROOM_COMPRESS_USER_MESSAGES=1`
+
+### Kompress-base never fires
+
+The Kompress-base transformer (HF model, ~262MB) takes 2-3 requests to load into memory. After warmup it fires when lighter compressors don't match. Force it with `HEADROOM_FORCE_KOMPRESS=1`.
+
+If you want the iGPU to accelerate Kompress-base, install `intel-extension-for-pytorch`. **As of 2026-06, IPEX does not support Python 3.14** — top is Python 3.12. Without IPEX, Kompress-base runs on CPU.
+
+## See also
+
+- [Proxy Server](/docs/proxy) — generic proxy documentation
+- [Configuration](/docs/configuration) — full env var reference
+- [Troubleshooting](/docs/troubleshooting) — common errors
+- [Ollama Cloud](https://ollama.com/cloud) — upstream service

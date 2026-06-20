@@ -240,9 +240,20 @@ headroom proxy --backend vertex_ai --region us-central1
 # Azure OpenAI
 headroom proxy --backend azure
 
-# OpenRouter (400+ models)
-OPENROUTER_API_KEY=sk-or-... headroom proxy --backend openrouter
+OpenRouter (400+ models)
+OPENROUTER_API_KEY=*** headroom proxy --backend openrouter
+
+# Ollama Cloud (OpenAI-compatible — set OPENAI_TARGET_API_URL)
+export OPENAI_TARGET_API_URL=https://ollama.com/v1
+export OPENAI_API_KEY=***  # Ollama Cloud key
+headroom proxy
+
+# Local Ollama server
+export OPENAI_TARGET_API_URL=http://localhost:11434/v1
+headroom proxy
 ```
+
+See the [Ollama Cloud integration guide](/docs/ollama-cloud) for full setup with Hermes Agent, iGPU, and systemd deployment.
 
 ### Bedrock via a local gateway
 
