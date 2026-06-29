@@ -21,6 +21,7 @@ State file: ~/.headroom/failsafe-state.json (separate from watchdog state
 Log file:   ~/.headroom/failsafe.log
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -31,14 +32,24 @@ import urllib.error
 from datetime import datetime
 from pathlib import Path
 
-# ---- Config ----
-HEADROOM_URL = "http://127.0.0.1:8787"
-DIRECT_URL = "https://ollama.com/v1"
+# ---- Config (HEADROOM_URL/DIRECT_URL defined above) ----
 HEALTHCHECK_TIMEOUT = 3
 SELF_HEAL_FAILURES_THRESHOLD = 3
 STATE_FILE = Path.home() / ".headroom" / "failsafe-state.json"
 WATCHDOG_STATE_FILE = Path.home() / ".headroom" / "watchdog-state.json"
 LOG_FILE = Path.home() / ".headroom" / "failsafe.log"
+# Operator-controlled mode file. Values: "auto" (default), "learn", "crawl".
+# In "learn" or "crawl" mode the failsafe pins routing to direct Ollama
+# regardless of headroom health. Useful for: scraping/crawling where
+# compression overhead exceeds savings, or training data ingestion where
+# every prompt is unique.
+MODE_FILE = Path.home() / ".headroom" / "failsafe-mode"
+DIRECT_URL = "https://ollama.com/v1"
+HEADROOM_URL = "http://127.0.0.1:8787"
+LEARN_MODE_URLS = {
+    "learn": "https://ollama.com/v1",
+    "crawl": "https://ollama.com/v1",
+}
 
 
 def log(msg):
@@ -51,20 +62,27 @@ def log(msg):
 
 
 def load_state():
+    """Load failsafe state, backfilling any missing keys for forward compat."""
+    state = {}
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE) as f:
-                return json.load(f)
+                state = json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
-    return {
+    defaults = {
         "routing": "headroom",  # "headroom" | "direct" | "unknown"
         "last_action": None,
         "last_action_at": None,
         "last_killswitch_at": None,
         "last_recovery_at": None,
         "flips_total": 0,
+        "mode": "auto",  # last-observed operator mode
+        "mode_pinned_flips": 0,  # flips caused by mode change rather than health
     }
+    for k, v in defaults.items():
+        state.setdefault(k, v)
+    return state
 
 
 def save_state(state):
@@ -247,9 +265,48 @@ def flip_to_headroom(state, reason):
         return False
 
 
+def get_mode():
+    """Read operator-set mode. Returns "auto" | "learn" | "crawl".
+
+    Read from MODE_FILE. Strips whitespace, lowercases, defaults to "auto".
+    Unknown values are coerced to "auto" + logged.
+    """
+    if not MODE_FILE.exists():
+        return "auto"
+    try:
+        with open(MODE_FILE) as f:
+            val = f.read().strip().lower()
+    except OSError as e:
+        log(f"FAILSAFE: get_mode read error: {e}")
+        return "auto"
+    if val not in ("auto", "learn", "crawl"):
+        log(f"FAILSAFE: unknown mode '{val}' in {MODE_FILE}, treating as 'auto'")
+        return "auto"
+    return val
+
+
+def set_mode(new_mode):
+    """Write mode to MODE_FILE. Returns True on success."""
+    if new_mode not in ("auto", "learn", "crawl"):
+        log(f"FAILSAFE: set_mode rejected invalid mode '{new_mode}'")
+        return False
+    MODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(MODE_FILE, "w") as f:
+            f.write(new_mode + "\n")
+        os.chmod(MODE_FILE, 0o644)
+        log(f"FAILSAFE: mode set to '{new_mode}'")
+        return True
+    except OSError as e:
+        log(f"FAILSAFE: set_mode write error: {e}")
+        return False
+
+
 def tick():
     """One iteration of the failsafe loop."""
     state = load_state()
+    mode = get_mode()
+    state["mode"] = mode
     current_url = get_current_base_url()
 
     # Where does Hermes think it's routing right now?
@@ -259,6 +316,37 @@ def tick():
         effective_routing = "direct"
     else:
         effective_routing = "unknown"
+
+    # ---- Mode override (learn / crawl) ----
+    # If operator has set learn or crawl mode, force routing to direct regardless
+    # of headroom health. This is an immediate-effect operator toggle.
+    if mode in ("learn", "crawl"):
+        if effective_routing != "direct":
+            target_url = LEARN_MODE_URLS[mode]
+            log(f"MODE OVERRIDE: mode={mode} forcing direct routing to {target_url}")
+            try:
+                subprocess.run(
+                    ["hermes", "config", "set", "model.base_url", target_url],
+                    check=True, timeout=10,
+                )
+                state["routing"] = "direct"
+                state["last_action"] = f"mode-pinned: {mode}"
+                state["last_action_at"] = datetime.now().isoformat(timespec="seconds")
+                state["flips_total"] += 1
+                state["mode_pinned_flips"] += 1
+                save_state(state)
+                log(f"MODE OVERRIDE: flipped to direct ({mode}) — flips_total={state['flips_total']}")
+            except subprocess.CalledProcessError as e:
+                log(f"MODE OVERRIDE: hermes config set rc={e.returncode}")
+            except Exception as e:
+                log(f"MODE OVERRIDE: {type(e).__name__}: {e}")
+        # In mode-pinned state, do not run normal flip/recover logic below.
+        # Stay direct until mode changes back to "auto".
+        return
+
+    # If mode is "auto" and we're routed direct because of a previous learn/crawl
+    # pin, but routing should now reflect actual headroom health, fall through to
+    # the normal decision matrix below. (Recovery back to headroom happens here.)
 
     # Probe headroom (readyz + auth)
     readyz_ok, auth_ok, detail = check_headroom()
@@ -303,9 +391,77 @@ def tick():
     save_state(state)
 
 
+def show_status():
+    """Print current mode + state for operator inspection."""
+    mode = get_mode()
+    state = load_state()
+    print(f"mode:           {mode}")
+    print(f"routing:        {state.get('routing', 'unknown')}")
+    print(f"flips_total:    {state.get('flips_total', 0)}")
+    print(f"mode_pinned:    {state.get('mode_pinned_flips', 0)}")
+    print(f"last_action:    {state.get('last_action', 'none')}")
+    print(f"last_action_at: {state.get('last_action_at', 'never')}")
+    print(f"mode_file:      {MODE_FILE}")
+    return 0
+
+
+def apply_mode_immediate(new_mode):
+    """Set mode and immediately force the routing flip in this process.
+
+    Used when the operator toggles via CLI but the daemon is not running —
+    we still want the immediate-effect semantics.
+    """
+    if set_mode(new_mode):
+        if new_mode == "auto":
+            # Force a normal tick to recover if possible
+            tick()
+        else:
+            # Force-pin to direct right now
+            try:
+                subprocess.run(
+                    ["hermes", "config", "set", "model.base_url", DIRECT_URL],
+                    check=True, timeout=10,
+                )
+                state = load_state()
+                state["routing"] = "direct"
+                state["last_action"] = f"mode-pinned: {new_mode} (CLI)"
+                state["last_action_at"] = datetime.now().isoformat(timespec="seconds")
+                state["flips_total"] += 1
+                state["mode_pinned_flips"] += 1
+                save_state(state)
+                print(f"Mode set to '{new_mode}'. Routing forced to {DIRECT_URL}.")
+                print(f"  (the running failsafe daemon will see this on its next tick too)")
+            except Exception as e:
+                print(f"Mode set to '{new_mode}' but routing flip failed: {e}")
+                return 1
+    else:
+        print(f"Failed to set mode to '{new_mode}'")
+        return 1
+    return 0
+
+
 def main():
-    # Single-tick mode (used by systemd timer-style invocation)
-    if "--once" in sys.argv:
+    parser = argparse.ArgumentParser(
+        description="Headroom failsafe — reactive circuit breaker + mode override",
+    )
+    parser.add_argument("--once", action="store_true",
+                        help="Run a single tick and exit (systemd timer-style)")
+    parser.add_argument("--mode", choices=["auto", "learn", "crawl"],
+                        help="Set operator mode (auto=normal failsafe, learn/crawl=bypass headroom)")
+    parser.add_argument("--status", action="store_true",
+                        help="Show current mode + state")
+    args = parser.parse_args()
+
+    # CLI mode toggle (immediate effect)
+    if args.mode:
+        return apply_mode_immediate(args.mode)
+
+    # Status display
+    if args.status:
+        return show_status()
+
+    # Single-tick mode
+    if args.once:
         tick()
         return 0
 

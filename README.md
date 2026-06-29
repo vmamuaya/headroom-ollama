@@ -138,6 +138,24 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 # route your OpenAI/Anthropic-OAI traffic through the proxy
 ```
 
+## Bypass headroom (learn-mode / crawl-mode)
+
+For workloads where compression overhead exceeds savings — single-turn
+analysis, bulk scraping, corpus ingestion — you can pin routing to direct
+Ollama Cloud:
+
+```bash
+python3 ~/.local/bin/headroom-failsafe.py --mode learn     # analysis / agent training
+python3 ~/.local/bin/headroom-failsafe.py --mode crawl     # bulk scraping / corpus ingestion
+python3 ~/.local/bin/headroom-failsafe.py --mode auto      # return to normal failsafe
+python3 ~/.local/bin/headroom-failsafe.py --status         # inspect current mode
+```
+
+Effect is immediate — `hermes config set model.base_url https://ollama.com/v1`
+runs before the CLI exits. The running failsafe daemon will re-apply the
+pin on its next 30-second tick (defensive). See `docs/OPERATIONS.md` for
+full operational details.
+
 ## Verify
 
 ```bash

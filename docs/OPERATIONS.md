@@ -24,6 +24,72 @@ journalctl --user -u headroom-proxy.service -f
 hermes config show | grep base_url
 ```
 
+## Operator mode override (learn-mode / crawl-mode)
+
+Sometimes you want to bypass headroom entirely — every prompt is unique, or
+compression overhead exceeds savings. The failsafe supports two pinned-bypass
+modes: `learn` and `crawl`. Both have identical behavior (route direct to
+Ollama Cloud, no compression, no headroom) but are tracked separately in
+audit logs so you can tell why a session was unpinned.
+
+### Toggle modes
+
+```bash
+# Bypass headroom immediately for the current session (and all sessions
+# until you toggle back). Effect is immediate:
+python3 ~/.local/bin/headroom-failsafe.py --mode learn     # for analysis / agent training
+python3 ~/.local/bin/headroom-failsafe.py --mode crawl     # for bulk scraping / corpus ingestion
+
+# Toggle back to automatic failsafe behavior (returns to headroom if healthy):
+python3 ~/.local/bin/headroom-failsafe.py --mode auto
+
+# Inspect current state:
+python3 ~/.local/bin/headroom-failsafe.py --status
+```
+
+### What happens under the hood
+
+1. The mode string is written to `~/.headroom/failsafe-mode` (mode 0644).
+2. The CLI process immediately invokes `hermes config set model.base_url https://ollama.com/v1`.
+3. The running failsafe daemon (if active) reads the mode file on its next
+   30-second tick and re-applies the pin to defend against a Hermes restart
+   or another process overwriting the config.
+4. While mode is `learn` or `crawl`, the failsafe skips its normal
+   healthy/unhealthy decision matrix entirely. Routing stays direct.
+
+### State fields added
+
+The failsafe state file (`~/.headroom/failsafe-state.json`) gains two new
+fields so you can audit how often pinned modes were used:
+
+```json
+{
+  "mode": "learn",
+  "mode_pinned_flips": 3,
+  ...
+}
+```
+
+### When to use what
+
+| Use case | Mode | Why |
+|---|---|---|
+| Single-turn LLM lookups for analysis | `learn` | compression overhead > savings when context is always new |
+| Crawling/scraping with identical prompts | `crawl` | high cache hit rate already, compression redundant |
+| Bulk document summarization | `crawl` | unique inputs each turn, compression rate low |
+| Multi-turn agent with persistent state | `auto` | compression wins big here |
+| Conversation-heavy chat workloads | `auto` | prior-turn compression = biggest savings category |
+
+### Important caveats
+
+- The CLI runs in the foreground; you don't need sudo.
+- The toggle persists across reboots (mode file is on disk, not in tmpfs).
+- Toggling to `auto` triggers an immediate tick — if headroom is healthy,
+  you flip back within ~2 seconds. If headroom is broken, you stay on
+  direct until headroom recovers (standard failsafe behavior).
+- Both pinned modes bypass the watchdog's self-heal counter. Headroom can
+  be entirely down while learn/crawl is active and nothing else changes.
+
 ## Manual failover (don't wait for failsafe)
 
 ```bash
