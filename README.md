@@ -69,6 +69,104 @@ For OpenAI GPT-4o ($5/M input) the same numbers double to ~$1,140/month saved.
 The compression is invisible to the model: it sees compressed-but-coherent
 text. Empirically no quality regression on the workloads measured.
 
+## How headroom works
+
+Request flow, end to end:
+
+```
++--------------------+        +-----------------------+        +-------------------+
+|  Your agent / app  |        |   headroom proxy      |        |  Ollama Cloud     |
+|  (Hermes, OpenClaw)|  --->  |   127.0.0.1:8787      |  --->  |  https://ollama.com|
+|                    |  HTTP  |                       |  HTTPS |                   |
+|  POST /v1/chat/    |        |  +-----------------+  |        |  +-------------+  |
+|  completions       |        |  | 1. Receive raw  |  |        |  |  Tokenize   |  |
+|                    |        |  |    request      |  |        |  |  (no cache, |  |
+|  model: kimi-k2.6  |        |  +-----------------+  |        |  |  no compress)| |
+|  messages: [...]   |        |           |            |        |  +-------------+  |
++--------------------+        |           v            |        +-------------------+
+                              |  +-----------------+    |              |
+                              |  | 2. Compress     |    |              |
+                              |  |    messages     |    |              |
+                              |  |    (lossy for   |    |              |
+                              |  |     tokenizer,  |    |              |
+                              |  |     lossless    |    |              |
+                              |  |     for model)  |    |              |
+                              |  +-----------------+    |              |
+                              |           |            |              |
+                              |           v            |              |
+                              |  +-----------------+    |              |
+                              |  | 3. Cache lookup |    |              |
+                              |  |    (in-memory   |    |              |
+                              |  |     CCR, 1000   |    |              |
+                              |  |     entries)    |    |              |
+                              |  +-----------------+    |              |
+                              |           |            |              |
+                              |           v            |              |
+                              |  +-----------------+    |              |
+                              |  | 4. Forward to   |    |              |
+                              |  |    upstream     |    |              |
+                              |  |    (Ollama)     |    |              |
+                              |  +-----------------+    |              |
+                              |           |            |              |
+                              |  +-----------------+    |              |
+                              |  | 5. Receive resp |    |              |
+                              |  |    + log        |    |              |
+                              |  |    savings to   |    |              |
+                              |  |    journal      |    |              |
+                              |  +-----------------+    |              |
+                              +-----------|------------+
+                                          v
+                              +-----------------------+
+                              | proxy_savings.jsonl  |
+                              | (every minute:       |
+                              |  input/output/       |
+                              |  saved/savings_pct)  |
+                              +-----------------------+
+```
+
+The proxy is just a normal HTTP server speaking OpenAI's wire protocol. Your
+application points its `base_url` at the proxy, every other call is unchanged.
+
+Two layers of guard-rails wrap the proxy so a broken proxy can't take down
+your agents:
+
+```
++----------------------------------------------------+
+|              Watchdog (every 5 min)                |
+|  Probe /readyz + auth probe -> on failure:         |
+|    reinstall venv, restart service, fix shebang    |
+|    consecutive_self_heal_failures++                |
++------------------------|---------------------------+
+                         v
++----------------------------------------------------+
+|              Failsafe (every 30s)                  |
+|  if consecutive_self_heal_failures >= 3:           |
+|    flip model.base_url in agent config:            |
+|      http://127.0.0.1:8787/v1 -> ollama.com/v1     |
+|  if direct AND headroom healthy:                   |
+|    flip back automatically                         |
++----------------------------------------------------+
+```
+
+When the failsafe flips, your agent keeps working — it just stops paying
+for compression until the proxy is healthy again. The flip is reversible;
+once headroom recovers, you flip back.
+
+### What gets compressed
+
+- Repeated boilerplate (system prompts, tool schemas, persona descriptions)
+- Whitespace runs, redundant phrasing
+- Logs and stack traces (prose forms, not raw)
+- Re-sent conversation history (multi-turn chats)
+
+### What does NOT get compressed
+
+- Code blocks (preserved verbatim — backtick-fence boundaries respected)
+- JSON / YAML structured data
+- Anything inside `<preserve>` / `<raw>` tags
+- The most recent turn's user input (you want the model to see it exactly
+  as written)
+
 ## Why this matters if your cloud doesn't have cache baked in
 
 | Provider | Native prompt cache | Baked-in compression | What headroom adds |
@@ -83,6 +181,78 @@ For Ollama Cloud specifically: there's no native cache, no built-in
 compression, no batch discount. You're paying token-for-token at model list
 price. headroom is the only way to knock the bill down without changing
 models.
+
+## How headroom differs from RTK AI and Caveman AI
+
+There are other tools in the same neighborhood. Worth knowing what they are
+and where headroom sits.
+
+### The similarity
+
+All three are local-side tools that reduce what gets sent to a paid LLM
+endpoint:
+
+| Tool | Approach | What runs locally | What saves tokens |
+|---|---|---|---|
+| **headroom-ai** | Out-of-process HTTP proxy | `headroom` daemon on `127.0.0.1:8787` | Prose compression + in-memory CCR cache |
+| **RTK AI** (`rtk-ai` CLI) | Rust binary that rewrites commands | Wraps your shell + intercepts noisy CLI output | Pattern-replaces common CLI junk (e.g. `git status` raw output) |
+| **Caveman AI** (`cavemanai`) | Wrapper around CLI tool output | Sits between your shell and LLM-backed CLIs | Drops noise from shell output before it hits the model |
+
+All three assume you control your local environment. All three make changes
+to the text going to the LLM that are invisible to the model.
+
+### Key differentiators
+
+| Dimension | headroom-ai | RTK AI | Caveman AI |
+|---|---|---|---|
+| **Architecture** | HTTP proxy (network-level) | CLI rewriter (process-level) | CLI pre-processor (process-level) |
+| **Wire protocol** | OpenAI-compatible — drop-in for any OAI client | N/A, shell-commands only | N/A, shell-commands only |
+| **Applies to** | Any HTTP/SSE LLM call (chat, completions, embeddings) | Shell commands (`git`, `ls`, `cat`, etc.) | Shell commands, mainly long-output ones |
+| **Token type saved** | Prose, multi-turn context, tool output | Shell-output patterns | Shell-output patterns |
+| **Cache model** | In-memory CCR (1000 entries, ~conversation lifetime) | None (rewrites per call) | None (rewrites per call) |
+| **Failure handling** | 2-layer watchdog + failsafe, auto-flips to direct on breakage | None — if it fails, your command fails | None — if it fails, command fails |
+| **Cost to ignore** | ~5ms per request on top of network round-trip | Zero (only intercepts when invoked) | Zero |
+| **Configurable aggressiveness** | `HEADROOM_TARGET_RATIO` env var | Pattern rules hardcoded | Pattern rules hardcoded |
+| **Tested with agentic OS** | Yes — Hermes (this repo) | Tested as a tool, not as a proxy | Tested as a tool, not as a proxy |
+
+The deepest difference is **what gets intercepted**. RTK AI and Caveman AI
+work at the **shell layer** — they make your `ls -la` output cheaper to
+send to a model. headroom works at the **network layer** — it makes
+**every** OpenAI-shaped HTTP request cheaper regardless of what produced
+it (shell command, agent loop, IDE, web app, etc.).
+
+The second deepest difference is **what happens when the tool breaks**.
+RTK AI and Caveman AI have no failure-recovery — if they crash or hang,
+your workflow stops. headroom's 2-layer failsafe (see above) detects
+broken states and flips your agent back to direct Ollama Cloud
+automatically, then recovers when headroom is healthy.
+
+### Who benefits most from each
+
+**Use headroom when:**
+
+  - Your agent or app makes LLM calls directly (not via shell)
+  - You're paying for tokens at model-list price (Ollama Cloud, OpenRouter,
+    vanilla OpenAI/Anthropic with no cache control)
+  - You have multi-turn conversations where prior turns get re-sent
+  - You need a proxy you can rely on without babysitting it
+
+**Use RTK AI when:**
+
+  - Your workflow is shell-heavy (`git`, `docker`, `kubectl`, etc.)
+  - You're feeding CLI output directly to a model (e.g. via Claude Code)
+  - You want zero-overhead CLI-level noise reduction
+
+**Use Caveman AI when:**
+
+  - Your workflow involves long-running shell commands with verbose output
+  - You want to dedupe / compress shell output before it reaches the LLM
+  - You prefer a process-level tool over a network-level proxy
+
+**Use headroom + RTK AI together when:** your agent does both HTTP LLM
+calls AND shell commands. They're orthogonal — RTK strips shell noise
+before it reaches headroom, headroom compresses the resulting prompt
+before it reaches the cloud. Layered savings.
 
 ## Distros tested
 
@@ -191,6 +361,55 @@ Net behavior:
 
 See `docs/OPERATIONS.md` for the full operational manual, `docs/SECURITY.md`
 for the threat model, and the source files in `bin/` for the actual code.
+
+## Tested with agentic OS
+
+This setup has been developed and validated against **[Hermes](https://github.com/vmamuaya/hermes)** —
+a self-hosted CLI agentic OS that supports multiple model backends and
+profiles. Specifically validated against:
+
+  - **Routing model**: Hermes exposes `model.base_url` in its config and
+    reads it on every request, so flipping the URL is instant. No restart
+    required.
+  - **Profile switching**: works with Hermes profile-based config
+    (the failsafe flips inside the active profile).
+  - **Cross-session persistence**: `~/.headroom/failsafe-mode` survives
+    reboots, so a learn-mode / crawl-mode toggle applies to the next
+    session that starts.
+  - **Telemetry**: Hermes can read the proxy's `/stats` endpoint if you
+    want to surface compression stats in your dashboard.
+
+### Likely works with other agentic OS
+
+The pattern headroom assumes is simple enough that any agentic OS with
+a standard config-reload flow should work:
+
+  - **OpenClaw** — open-source agentic OS with config-driven routing.
+    Point its `base_url` at `127.0.0.1:8787/v1` and the proxy transparently
+    compresses. Failsafe flips should work the same way (config-write +
+    reload).
+  - **OpenHuman** — Claude-style CLI with config file at `~/.config/...`.
+    Compatible with the same `base_url` swap pattern.
+  - **OpenFang** — agent framework with hot-reload config. Drop in
+    headroom by setting the routing URL, the failsafe writes the config
+    file and OpenFang picks it up.
+
+The only failure mode is: agentic OS that **require a full process restart
+to reload config**. In that case, the failsafe will write the correct
+URL but the agent won't pick it up until restart. The failsafe detects
+this case by checking the current `base_url` after each flip — if it's
+still wrong, the failsafe logs a warning suggesting manual restart.
+
+To verify on a new agentic OS:
+
+  1. Install headroom: `./scripts/install.sh`
+  2. Point the agent at the proxy: `base_url=http://127.0.0.1:8787/v1`
+  3. Send a request, check the journal for `savings_pct` > 0
+  4. Toggle learn-mode: `python3 ~/.local/bin/headroom-failsafe.py --mode learn`
+  5. Verify the agent now routes to Ollama Cloud directly
+
+If step 5 doesn't take effect, your agentic OS likely needs a restart on
+config change — the failsafe log will say so.
 
 ## Repo layout
 
