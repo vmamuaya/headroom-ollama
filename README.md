@@ -1,8 +1,61 @@
 # headroom-ollama
 
+> **Heads-up — this is NOT vanilla upstream headroom-ai.**
+>
+> This repository is a heavily-modified fork tailored for **Hermes (agentic
+> OS) + Ollama Cloud**. The upstream project at
+> [chopratejas/headroom](https://github.com/chopratejas/headroom) is designed
+> and built primarily for **Codex and Claude Code**, and it ships as much
+> more than just a proxy (CLI tooling, prompt-rewriting libraries, IDE
+> integrations, etc.).
+>
+> What's different here:
+>
+> | | Upstream headroom-ai | This fork (`headroom-ollama`) |
+> |---|---|---|
+> | Primary target | Codex, Claude Code, IDE-integrated workflows | Hermes agentic OS + Ollama Cloud |
+> | What it ships | Library + CLI + proxy + IDE hooks + skill packs | Just the **proxy** + a 2-layer failsafe stack |
+> | Provider target | Anthropic / OpenAI (native prompt cache assumed) | Ollama Cloud (no native cache, no compression) |
+> | Cache strategy | Compress-only; assume provider handles cache | Compress **plus** in-memory CCR (because cloud doesn't cache) |
+> | Self-healing | Manual — restart on failure | Automatic — watchdog (5 min) + failsafe (30 s) auto-repair |
+> | Routing model | Direct | Mutable — headroom <-> direct Ollama, with learn-mode/crawl-mode bypass |
+> | Distro support | Whatever you compile on | Fedora / Ubuntu / Debian / Arch (validated) |
+>
+> If you're using Codex / Claude Code and want the full upstream feature
+> set, install upstream directly. If you're running Hermes against Ollama
+> Cloud and want compression + bulletproof self-healing + bypass toggles,
+> you're in the right place.
+
 One-shot clone setup for running the [headroom-ai](https://github.com/chopratejas/headroom)
 compression proxy against [Ollama Cloud](https://ollama.com), with a 2-layer
 failsafe stack so the proxy transparently heals itself when it breaks.
+
+### Who this fork is for (and isn't for)
+
+**Use this fork if:**
+
+  - You run Hermes (or any agentic OS with `base_url` config) and need to
+    cut Ollama Cloud token spend without changing models.
+  - You want a proxy that fixes itself when it breaks, with a kill-switch
+    that flips your agent back to direct Ollama Cloud automatically.
+  - You need bypass toggles (`learn-mode`, `crawl-mode`) for workloads
+    where compression overhead exceeds savings.
+
+**Don't use this fork — use upstream headroom-ai instead if:**
+
+  - You're running Codex or Claude Code and want the full tool set:
+    built-in CLI rewriters, prompt-rewriting libraries, IDE hook
+    integrations, or any of the skill packs.
+  - You're hitting Anthropic / OpenAI directly and want to leverage
+    their native prompt cache (upstream is tuned for that; this fork
+    is tuned for clouds that *don't* have native cache).
+  - You want a library to embed compression into your own app code
+    (upstream ships a Python crate; this fork is proxy-only).
+  - You need upstream's CCR + RTK + Caveman-style CLI tooling all in
+    one place — those live in separate upstream repos and aren't
+    bundled here.
+
+In short: **upstream is a toolchain; this fork is a single-purpose proxy**.
 
 Clone on a fresh machine, run one script, and you have:
 
