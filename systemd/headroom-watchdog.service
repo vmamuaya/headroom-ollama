@@ -1,0 +1,13 @@
+[Unit]
+Description=Headroom Watchdog — Phase 2 self-heal (5-min cadence)
+Documentation=file:///home/victor/.headroom/watchdog.log
+After=network-online.target headroom-proxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+ExecStart=/usr/bin/python3 /home/victor/.local/bin/headroom-watchdog.py
+StandardOutput=append:/home/victor/.headroom/watchdog.log
+StandardError=append:/home/victor/.headroom/watchdog.log

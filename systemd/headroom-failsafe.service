@@ -1,0 +1,18 @@
+[Unit]
+Description=Headroom Failsafe — reactive kill-switch daemon
+Documentation=file:///home/victor/.headroom/failsafe.log
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+ExecStart=/usr/bin/python3 /home/victor/.local/bin/headroom-failsafe.py
+StandardOutput=append:/home/victor/.headroom/failsafe.log
+StandardError=append:/home/victor/.headroom/failsafe.log
+
+[Install]
+WantedBy=default.target

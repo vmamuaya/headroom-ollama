@@ -1,0 +1,12 @@
+[Unit]
+Description=Headroom Watchdog Timer — runs every 5 minutes
+Documentation=https://hermes-agent.nousresearch.com/docs
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

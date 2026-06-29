@@ -1,0 +1,20 @@
+[Unit]
+Description=Headroom Token-Saver Proxy
+Documentation=https://github.com/chopratejas/headroom
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/victor/.local/venvs/headroom
+EnvironmentFile=/home/victor/.headroom/headroom.env
+ExecStart=/bin/bash -c "set -a && source /home/victor/.headroom/headroom.env && set +a && exec /home/victor/.local/venvs/headroom/bin/headroom proxy --port 8787 --host 127.0.0.1 --workers 1 --no-ccr-inject-tool"
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+StandardOutput=append:/tmp/headroom-proxy.log
+StandardError=append:/tmp/headroom-proxy.log
+
+[Install]
+WantedBy=default.target
