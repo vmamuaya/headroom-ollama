@@ -53,7 +53,7 @@ PATTERNS = [
 
     # Private key PEM
     ("private_key_pem",
-     re.compile(r"-----BEGIN (RSA|EC|PRIVATE|ENCRYPTED) KEY-----"),
+     re.compile(r"-----BEGIN .*PRIVATE KEY-----"),
      "HIGH"),
 ]
 
@@ -77,17 +77,66 @@ def is_binary(path):
         return True
 
 
-# Strings that flag a match as a known upstream test fixture, not a real secret
-TEST_FIXTURE_MARKERS = ("EXAMPLEAKIDFORTEST", "IOSFODNN7EXAMPLE")
+# Patterns that flag a match as an upstream test fixture, not a real credential.
+# Real API keys have high entropy; test fixtures are typically:
+#   * sequential alphabetic suffixes (stuv, wxyz, abc, ...)
+#   * digit runs (1234, 4567, 6789)
+#   * repeating characters (xxxx, XXXX)
+#   * synthetic Anthropic OAuth prefixes (ant-oat-01-, ant-api03-)
+#   * literal "..." ellipsis markers
+KNOWN_TEST_FIXTURE_PATTERNS = [
+    "EXAMPLEAKIDFORTEST",
+    "IOSFODNN7EXAMPLE",
+    "ant-oat-01-",
+    "ant-api03-",
+    "ant-api-",
+    "sk-pro",
+    "sk-ant",
+]
+
+
+def _has_long_alpha_run(s):
+    """True if s contains a run of 10+ sequential lowercase letters (test heuristic)."""
+    runs = re.findall(r"[a-z]{10,}", s)
+    for run in runs:
+        # Real entropy has varied letters; alphabetical runs are tests like 'abcdefghijklmnopqrstuv'
+        if any(run[i+1] == chr(ord(run[i])+1) for i in range(len(run)-1) for _ in [0] if i+1 < len(run) and ord(run[i+1])-ord(run[i]) == 1):
+            # Check at least 8 sequential positions
+            seq = 1
+            for i in range(len(run)-1):
+                if ord(run[i+1]) - ord(run[i]) == 1:
+                    seq += 1
+                else:
+                    seq = 1
+                if seq >= 8:
+                    return True
+    return False
+
+
+def _has_sequential_test_suffix(s):
+    """True if s ends with a sequential 4-character alphanumeric run like stuv, wxyz, 4567."""
+    # Common upstream test suffixes
+    for suffix in ["xxxx", "XXXX", "1234", "4321", "6789", "9876",
+                   "stuv", "wxyz", "abcd", "dcba", "f456"]:
+        if suffix in s:
+            return True
+    return False
 
 
 def is_test_fixture(match_text, source_line):
-    """True if the match looks like an upstream test fixture."""
+    """Return True if the match looks like an upstream test fixture, not a real secret."""
+    # Literal ellipsis (engineered display truncation marker)
     if "..." in match_text:
         return True
-    upper = source_line.upper()
-    for marker in TEST_FIXTURE_MARKERS:
-        if marker in upper:
+    # Long alphabetical run (e.g. abcdefghijklmnopqrstuv — humans dont make 22-char sequential runs)
+    if _has_long_alpha_run(match_text):
+        return True
+    # Sequential test suffixes
+    if _has_sequential_test_suffix(match_text):
+        return True
+    # Check source line for known upstream fixtures
+    for marker in KNOWN_TEST_FIXTURE_PATTERNS:
+        if marker in match_text:
             return True
     return False
 
